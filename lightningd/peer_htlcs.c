@@ -1,3 +1,4 @@
+#include <bitcoin/preimage.h>
 #include <bitcoin/tx.h>
 #include <ccan/build_assert/build_assert.h>
 #include <ccan/cast/cast.h>
@@ -624,10 +625,22 @@ struct htlc_accepted_hook_payload {
 	u8 *next_onion;
 };
 
+/* The possible return value types that a plugin may return for the
+ * `htlc_accepted` hook. */
+enum htlc_accepted_result {
+	htlc_accepted_continue,
+	htlc_accepted_fail,
+	htlc_accepted_resolve,
+};
+
 /**
  * Response type from the plugin
  */
 struct htlc_accepted_hook_response {
+	enum htlc_accepted_result result;
+	struct preimage payment_key;
+	enum onion_type failure_code;
+	u8 *channel_update;
 };
 
 /**
@@ -637,7 +650,65 @@ static struct htlc_accepted_hook_response *
 htlc_accepted_hook_deserialize(const tal_t *ctx, const char *buffer,
 			       const jsmntok_t *toks)
 {
-	return NULL;
+	struct htlc_accepted_hook_response *response;
+	const jsmntok_t *resulttok, *failcodetok, *paykeytok, *chanupdtok;
+
+	resulttok = json_get_member(buffer, toks, "result");
+
+	/* If the result is "continue" we can just return NULL since
+	 * this is the default behavior for this hook anyway */
+	if (!resulttok) {
+		fatal("Plugin return value does not contain 'result' key %s",
+		      json_tok_full(buffer, toks));
+	}
+
+	if (json_tok_streq(buffer, resulttok, "continue")) {
+		return NULL;
+	}
+
+	response = tal(ctx, struct htlc_accepted_hook_response);
+	if (json_tok_streq(buffer, resulttok, "fail")) {
+		response->result = htlc_accepted_fail;
+		failcodetok = json_get_member(buffer, toks, "failure_code");
+		chanupdtok = json_get_member(buffer, toks, "channel_update");
+		if (!failcodetok || !json_to_number(buffer, failcodetok,
+						    &response->failure_code)) {
+			/* Use unknown payment hash since it has no
+			 * long lasting effect but will still prevent
+			 * the sender from retrying. In the newest
+			 * spec it is called "incorrect or unknown
+			 * payment details" which matches our use-case
+			 * pretty closely. */
+			response->failure_code =
+			    WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS;
+		}
+
+		if (chanupdtok)
+			response->channel_update =
+			    json_tok_bin_from_hex(response, buffer, chanupdtok);
+		else
+			response->channel_update = NULL;
+
+	} else if (json_tok_streq(buffer, resulttok, "resolve")) {
+		response->result = htlc_accepted_resolve;
+		paykeytok = json_get_member(buffer, toks, "payment_key");
+		if (!paykeytok)
+			fatal(
+			    "Plugin did not specify a 'payment_key' in return "
+			    "value to the htlc_accepted hook: %s",
+			    json_tok_full(buffer, resulttok));
+
+		if (!json_to_preimage(buffer, paykeytok,
+				      &response->payment_key))
+			fatal("Plugin specified an invalid 'payment_key': %s",
+			      json_tok_full(buffer, resulttok));
+	} else {
+		fatal("Plugin responded with an unknown result to the "
+		      "htlc_accepted hook: %s",
+		      json_tok_full(buffer, resulttok));
+	}
+
+	return response;
 }
 
 static void htlc_accepted_hook_serialize(struct htlc_accepted_hook_payload *p,
@@ -650,7 +721,7 @@ static void htlc_accepted_hook_serialize(struct htlc_accepted_hook_payload *p,
 	json_object_start(s, "hop_data");
 	json_add_hex(s, "realm", &rs->hop_data.realm, 1);
 	json_add_short_channel_id(s, "short_channel_id", &rs->hop_data.channel_id);
-	json_add_u64(s, "amt_to_forward", rs->hop_data.amt_forward);
+	json_add_amount_msat(s, rs->hop_data.amt_forward, "amt_to_forward", "forward_msat");
 	json_add_u64(s, "outgoing_cltv_value", rs->hop_data.outgoing_cltv);
 	json_object_end(s);
 
@@ -659,7 +730,7 @@ static void htlc_accepted_hook_serialize(struct htlc_accepted_hook_payload *p,
 	json_object_end(s);
 
 	json_object_start(s, "htlc");
-	json_add_u64(s, "msatoshi", hin->msatoshi);
+	json_add_amount_msat(s, hin->msat, "msatoshi", "msat");
 	json_add_u64(s, "cltv_expiry", hin->cltv_expiry);
 	json_add_hex(s, "payment_hash", hin->payment_hash.u.u8, sizeof(hin->payment_hash));
 	json_object_end(s);
